@@ -7,13 +7,13 @@
 #include <linux/io.h>
 #include <linux/device.h>
 #include <linux/version.h>
-#include <linux/kernel.h>  // Для kstrtou8_from_user
-#include <linux/mutex.h>   // Для mutex
+#include <linux/kernel.h>
+#include <linux/mutex.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("AI Assistant & User");
-MODULE_DESCRIPTION("Safe Char Driver for ASIX AX99100 LPT Bits Control");
-MODULE_VERSION("1.2");
+MODULE_DESCRIPTION("Safe and Optimized Char Driver for ASIX AX99100 LPT");
+MODULE_VERSION("1.4");
 
 #define DEVICE_NAME "ax99100_lpt"
 #define CLASS_NAME  "ax99100"
@@ -34,24 +34,21 @@ static struct class *driver_class = NULL;
 static unsigned long io_base = 0;
 static resource_size_t io_len = 0;
 static bool is_io_mapped = false;
-static DEFINE_MUTEX(ax99100_mutex); // Мьютекс для защиты состояния устройства
+static DEFINE_MUTEX(ax99100_mutex); // Защита состояния устройства
 
 static ssize_t lpt_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
     u8 val;
     int ret;
 
-    pr_info("ax99100_lpt: lpt_write entry (count=%zu, ppos=%lld)\n", count, *ppos);
-
     if (count == 0) return 0;
 
-    // Безопасное чтение и преобразование строки в 8-битное число (0-255)
+    // Конвертируем строку от пользователя в байт (0-255)
     ret = kstrtou8_from_user(buf, count, 0, &val);
     if (ret) {
         pr_err("ax99100_lpt: Invalid string format or value out of range (0-255)\n");
         return ret == -ERANGE ? -EINVAL : ret;
     }
 
-    // Защита от гонки данных с функцией remove
     mutex_lock(&ax99100_mutex);
     if (!is_io_mapped || !io_base) {
         mutex_unlock(&ax99100_mutex);
@@ -59,12 +56,12 @@ static ssize_t lpt_write(struct file *file, const char __user *buf, size_t count
         return -EIO;
     }
 
-    // Приведение к unsigned short для соответствия сигнатуре outb
+    // Запись в базовый порт данных LPT
     outb(val, (unsigned short)io_base);
     pr_info("ax99100_lpt: Written 0x%02X to I/O port 0x%lX\n", val, io_base);
     mutex_unlock(&ax99100_mutex);
 
-    *ppos += count; // Стандартное поведение для файловых операций
+    *ppos += count; 
     return count;
 }
 
@@ -75,43 +72,48 @@ static const struct file_operations fops = {
 };
 
 static int ax99100_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
-    int bar;
+    int target_bars[] = {0, 1};
     unsigned long bar_flags;
     resource_size_t bar_start, bar_len;
+    int ret, i, bar;
+    bool bar_found = false;
 
-    // 0x0701 - класс Parallel Port
+    // Проверяем класс PCI (0x0701 - Parallel Port)
     if ((pdev->class >> 8) != 0x0701) {
+        pr_err("ax99100_lpt: PCI device class is not Parallel Port\n");
         return -ENODEV;
     }
-
-    pr_info("ax99100_lpt: PCI device found!\n");
 
     mutex_lock(&ax99100_mutex);
     if (is_io_mapped) {
         mutex_unlock(&ax99100_mutex);
-        pr_warn("ax99100_lpt: Another instance is already mapped. Multi-device not supported yet.\n");
+        pr_warn("ax99100_lpt: Another instance is active. Multi-device not supported.\n");
         return -EBUSY;
     }
     mutex_unlock(&ax99100_mutex);
 
-    if (pci_enable_device(pdev)) {
+    ret = pci_enable_device(pdev);
+    if (ret) {
         pr_err("ax99100_lpt: Failed to enable PCI device\n");
-        return -EIO;
+        return ret;
     }
 
-    for (bar = 0; bar < 6; bar++) {
+    // Бронируем регионы платы в ядре
+    ret = pci_request_regions(pdev, DEVICE_NAME);
+    if (ret) {
+        pr_err("ax99100_lpt: Failed to request PCI regions\n");
+        goto err_disable_pci;
+    }
+
+    // Целенаправленный опрос только BAR0 и BAR1
+    for (i = 0; i < 2; i++) {
+        bar = target_bars[i];
         bar_flags = pci_resource_flags(pdev, bar);
-        if (bar_flags & IORESOURCE_IO) {
+        
+        // Регистр должен быть I/O типа и строго 8 байт длиной (стандарт SPP LPT)
+        if ((bar_flags & IORESOURCE_IO) && pci_resource_len(pdev, bar) == 8) {
             bar_start = pci_resource_start(pdev, bar);
             bar_len = pci_resource_len(pdev, bar);
-
-            if (bar_len == 0)
-                continue;
-
-            if (!request_region(bar_start, bar_len, DEVICE_NAME)) {
-                pr_err("ax99100_lpt: I/O region 0x%llx busy\n", (unsigned long long)bar_start);
-                continue;
-            }
 
             mutex_lock(&ax99100_mutex);
             io_base = (unsigned long)bar_start;
@@ -119,36 +121,37 @@ static int ax99100_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
             is_io_mapped = true;
             mutex_unlock(&ax99100_mutex);
 
-            pr_info("ax99100_lpt: Using BAR%d at I/O port: 0x%llx (length: %llu)\n",
-                    bar, (unsigned long long)bar_start, (unsigned long long)bar_len);
-            return 0; // Успешный выход из probe
+            pr_info("ax99100_lpt: Automatically detected LPT at BAR%d, I/O port: 0x%llx\n",
+                    bar, (unsigned long long)bar_start);
+            
+            bar_found = true;
+            break; // Нашли нужный BAR, досрочно выходим из цикла
         }
     }
 
-    pr_err("ax99100_lpt: No valid I/O BAR found or all regions busy\n");
+    if (!bar_found) {
+        pr_err("ax99100_lpt: No valid 8-byte LPT I/O region found at BAR0 or BAR1\n");
+        ret = -ENODEV;
+        goto err_release_regions;
+    }
+
+    return 0;
+
+err_release_regions:
+    pci_release_regions(pdev);
+err_disable_pci:
     pci_disable_device(pdev);
-    return -ENODEV;
+    return ret;
 }
 
 static void ax99100_remove(struct pci_dev *pdev) {
-    unsigned long base_to_release = 0;
-    resource_size_t len_to_release = 0;
-
     mutex_lock(&ax99100_mutex);
-    if (is_io_mapped && io_base && io_len) {
-        // Сначала снимаем флаг, чтобы write сразу видел невалидность
-        is_io_mapped = false;
-        base_to_release = io_base;
-        len_to_release = io_len;
-        io_base = 0;
-        io_len = 0;
-    }
+    is_io_mapped = false;
+    io_base = 0;
+    io_len = 0;
     mutex_unlock(&ax99100_mutex);
 
-    if (base_to_release && len_to_release) {
-        release_region(base_to_release, len_to_release);
-    }
-
+    pci_release_regions(pdev);
     pci_disable_device(pdev);
     pr_info("ax99100_lpt: PCI device removed\n");
 }
@@ -210,7 +213,7 @@ static int __init ax99100_init(void) {
 }
 
 static void __exit ax99100_exit(void) {
-    pci_unregister_driver(&ax99100_driver); // Это вызовет ax99100_remove для всех устройств
+    pci_unregister_driver(&ax99100_driver);
     device_destroy(driver_class, dev_num);
     class_destroy(driver_class);
     cdev_del(&char_dev);
